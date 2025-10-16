@@ -1,0 +1,95 @@
+<#
+.SYNOPSIS
+    Automated RDMA Validation Test Runner
+.DESCRIPTION
+    Runs Mellanox / RDMA open-source tests including:
+        - ib_send_lat (send latency)
+        - ib_atomic_lat (atomic operations)
+        - NCCL / OSU benchmarks for AI/ML workloads
+        - Fabric / BMC log collection
+    Saves logs per cycle with timestamp.
+#>
+
+param(
+    [int]$Cycles = 3,
+    [string]$LogRoot = "C:\RDMA_Test_Logs",
+    [string]$IBDev = "mlx5_0",
+    [string]$ServerIP = "192.168.1.10",
+    [int]$Port = 5000,
+    [switch]$CollectBMCLogs
+)
+
+# Ensure log root exists
+if (!(Test-Path $LogRoot)) {
+    New-Item -ItemType Directory -Path $LogRoot | Out-Null
+}
+
+function Run-Test {
+    param(
+        [string]$Name,
+        [string]$Command,
+        [string]$Args,
+        [string]$LogFile
+    )
+    Write-Host "Running test: $Name"
+    Write-Host "Command: $Command $Args"
+
+    $startTime = Get-Date
+    try {
+        & $Command $Args *>&1 | Tee-Object -FilePath $LogFile
+    } catch {
+        Write-Host "Error running $Name: $_"
+        "`nError: $_" | Out-File -Append -FilePath $LogFile
+    }
+    $endTime = Get-Date
+    $duration = $endTime - $startTime
+    Write-Host "Completed $Name in $($duration.TotalSeconds) seconds"
+}
+
+# Main loop
+for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $cycleLogDir = Join-Path $LogRoot "Cycle_$cycle`_$timestamp"
+    New-Item -ItemType Directory -Path $cycleLogDir | Out-Null
+    Write-Host "`n=== Starting Cycle $cycle ==="
+
+    # 1. Send Latency Test
+    $logFile = Join-Path $cycleLogDir "ib_send_lat.log"
+    Run-Test -Name "IB Send Latency" -Command "ib_send_lat.exe" -Args "-d $IBDev -R -n 10000 $ServerIP" -LogFile $logFile
+
+    # 2. Atomic Operations Test
+    $logFile = Join-Path $cycleLogDir "ib_atomic_lat.log"
+    Run-Test -Name "IB Atomic Latency" -Command "ib_atomic_lat.exe" -Args "-d $IBDev -R -n 10000 $ServerIP" -LogFile $logFile
+
+    # 3. NCCL AI/ML Test (optional, GPU-based)
+    $ncclPath = "C:\nccl-tests\build\all_reduce_perf.exe"
+    if (Test-Path $ncclPath) {
+        $logFile = Join-Path $cycleLogDir "nccl_all_reduce_perf.log"
+        Run-Test -Name "NCCL All-Reduce Perf" -Command $ncclPath -Args "-b 8 -e 1G -f 2 -g 1" -LogFile $logFile
+    }
+
+    # 4. OSU Micro-Benchmarks
+    $osuPath = "C:\osu-micro-benchmarks\mpi\osu_latency.exe"
+    if (Test-Path $osuPath) {
+        $logFile = Join-Path $cycleLogDir "osu_latency.log"
+        Run-Test -Name "OSU Latency" -Command $osuPath -Args "-m 4:4096" -LogFile $logFile
+    }
+
+    # 5. Optional: Collect BMC / Fabric Logs
+    if ($CollectBMCLogs) {
+        $bmcLogFile = Join-Path $cycleLogDir "bmc_fabric.log"
+        Write-Host "Collecting BMC / Fabric logs..."
+        try {
+            # Example commands (adjust to your system)
+            & "C:\Mellanox\mlx5cmd.exe" "-d /dev/mst/mt4119_pciconf0 --register dump --index 0x500" *>&1 | Tee-Object -FilePath $bmcLogFile
+            & "C:\Mellanox\mlxconfig.exe" "-d /dev/mst/mt4119_pciconf0 query" *>&1 | Tee-Object -FilePath $bmcLogFile -Append
+        } catch {
+            Write-Host "Error collecting BMC logs: $_"
+        }
+    }
+
+    Write-Host "=== Cycle $cycle Completed ===`n"
+    Start-Sleep -Seconds 2
+}
+
+Write-Host "`nAll cycles completed. Logs saved under: $LogRoot"
