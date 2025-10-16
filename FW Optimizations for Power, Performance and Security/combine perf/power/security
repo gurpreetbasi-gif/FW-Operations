@@ -1,0 +1,32 @@
+// ctl_loop.c (sketch)
+#include <stdint.h>
+#include <stdatomic.h>
+#include <time.h>
+
+atomic_int running = 1;
+struct hist latency_hist;
+
+void apply_command_securely(const void *cmd, size_t len, const unsigned char *sig, size_t siglen) {
+    // verify signature with stored key (mbedTLS)
+    if (verify_signature(cmd, len, sig, siglen, PUBLIC_KEY_PEM) != 0) {
+        // drop command, log attempt
+        return;
+    }
+    // apply command quickly, no blocking operations here
+    hardware_apply((const uint8_t*)cmd, len);
+}
+
+void control_loop() {
+    while (atomic_load(&running)) {
+        uint64_t t0 = now_us();
+        // poll HW for sample (busy-poll if latency-critical)
+        if (hw_sample_ready()) {
+            process_sample();
+            uint64_t dt = now_us() - t0;
+            hist_add(&latency_hist, dt);
+            continue; // immediate next iteration for low jitter
+        }
+        // not busy -> yield to save power; coalesce with a short sleep
+        sleep_ns(500000); // 0.5ms
+    }
+}
