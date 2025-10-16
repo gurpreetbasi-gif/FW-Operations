@@ -1,0 +1,24 @@
+// irq_handler.c (pseudo - portable pattern)
+#include <stdatomic.h>
+
+// lock-free SPSC ring for deferred processing
+struct msg { int id; size_t len; void *payload; };
+
+void irq_top_half(void *arg) {
+    // Acknowledge interrupt in HW registers
+    hw_ack_irq();
+    // Enqueue pointer to buffer for worker
+    spsc_enqueue(&ring, buf);
+    // Return quickly
+}
+
+void worker_thread(void *arg) {
+    while (running) {
+        void *item;
+        while (spsc_dequeue(&ring, &item)) {
+            process_packet(item);
+        }
+        // sleep or yield to avoid busy spin if low rate
+        sleep_ns(100000);
+    }
+}
