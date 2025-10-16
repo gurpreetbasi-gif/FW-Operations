@@ -1,0 +1,13 @@
+struct hist {
+    uint64_t bins[64];
+    uint64_t min, max, sum, cnt;
+};
+
+void hist_add(struct hist *h, uint64_t v) {
+    int idx = 0;
+    while (v > (1ULL<<idx) && idx < 63) idx++;
+    h->bins[idx]++;
+    h->cnt++; h->sum += v;
+    if (!h->min || v < h->min) h->min = v;
+    if (v > h->max) h->max = v;
+}
