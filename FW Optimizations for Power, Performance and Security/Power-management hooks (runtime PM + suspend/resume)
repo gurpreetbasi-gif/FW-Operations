@@ -1,0 +1,15 @@
+// pm_hooks.c (Linux driver pattern)
+static int dev_suspend(struct device *dev) {
+    // quiesce device, save register state, turn off clocks
+    device_stop_dma(dev);
+    save_device_regs(dev);
+    clk_disable_unprepare(dev->clk);
+    return 0;
+}
+
+static int dev_resume(struct device *dev) {
+    clk_prepare_enable(dev->clk);
+    restore_device_regs(dev);
+    device_start_dma(dev);
+    return 0;
+}
