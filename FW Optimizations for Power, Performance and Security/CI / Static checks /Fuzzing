@@ -1,0 +1,7 @@
+# static
+cppcheck --enable=all --inconclusive --std=c99 src/
+clang-tidy src/*.c -- -Iinclude
+
+# build host tests with sanitizer (x86)
+gcc -fsanitize=address,undefined -g -O1 test/*.c -o test_runner
+./test_runner
