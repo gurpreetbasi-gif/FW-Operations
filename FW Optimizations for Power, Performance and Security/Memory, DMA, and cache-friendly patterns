@@ -1,0 +1,21 @@
+/* dma_buffer.c - allocate an aligned buffer for DMA; example for user-space mmap or baremetal */
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+
+void *dma_alloc_aligned(size_t size, size_t align) {
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, align, size) != 0) return NULL;
+    // If system needs cache flush: use API to set uncached region or flush caches.
+    return ptr;
+}
+
+int main() {
+    size_t sz = 2 * 1024 * 1024;
+    void *b = dma_alloc_aligned(sz, 4096);
+    if (!b) { perror("alloc"); return 1; }
+    printf("dma buffer %p\n", b);
+    // Use buffer for DMA transfers
+    free(b);
+    return 0;
+}
