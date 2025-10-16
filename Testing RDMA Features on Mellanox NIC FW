@@ -1,0 +1,428 @@
+// rdma_atomic_test.cpp
+// Build: g++ rdma_atomic_test.cpp -o rdma_atomic_test -lrdmacm -libverbs -lpthread -std=c++17 -O2
+//
+// Minimal test harness for QP management + atomic ops validation.
+//
+// NOTE: This is a test/demo. Extend for production: error handling, timeouts, retries,
+// security on control plane, and metrics collection pipelines.
+
+#include <arpa/inet.h>
+#include <infiniband/verbs.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cstring>
+#include <errno.h>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <thread>
+#include <vector>
+
+using namespace std::chrono;
+using namespace std;
+
+static const int DEFAULT_CQ_SIZE = 1024;
+static const int DEFAULT_RX_DEPTH = 128;
+static const uint32_t DEFAULT_PSN = 0x1234;
+static const int CONTROL_MSG_SIZE = 256;
+
+struct ConnInfo {
+    uint32_t qpn;
+    uint32_t psn;
+    uint16_t lid;
+    uint32_t rkey;
+    uint64_t vaddr;
+};
+
+static inline uint16_t get_local_lid(struct ibv_context* ctx, int port) {
+    ibv_port_attr attr;
+    if (ibv_query_port(ctx, port, &attr)) return 0;
+    return attr.lid;
+}
+
+// tiny TCP control plane for exchanging ConnInfo
+void send_conninfo(int fd, const ConnInfo &ci) {
+    char buf[CONTROL_MSG_SIZE] = {};
+    // pack: qpn|psn|lid|rkey|vaddr (network order)
+    uint32_t qpn_n = htonl(ci.qpn);
+    uint32_t psn_n = htonl(ci.psn);
+    uint16_t lid_n = htons(ci.lid);
+    uint32_t rkey_n = htonl(ci.rkey);
+    uint64_t vaddr_n = htobe64(ci.vaddr);
+
+    size_t offset = 0;
+    memcpy(buf + offset, &qpn_n, sizeof(qpn_n)); offset += sizeof(qpn_n);
+    memcpy(buf + offset, &psn_n, sizeof(psn_n)); offset += sizeof(psn_n);
+    memcpy(buf + offset, &lid_n, sizeof(lid_n)); offset += sizeof(lid_n);
+    memcpy(buf + offset, &rkey_n, sizeof(rkey_n)); offset += sizeof(rkey_n);
+    memcpy(buf + offset, &vaddr_n, sizeof(vaddr_n)); offset += sizeof(vaddr_n);
+
+    ssize_t s = send(fd, buf, offset, 0);
+    if (s != (ssize_t)offset) {
+        perror("send_conninfo");
+        throw runtime_error("send_conninfo failed");
+    }
+}
+
+ConnInfo recv_conninfo(int fd) {
+    char buf[CONTROL_MSG_SIZE] = {};
+    ssize_t r = recv(fd, buf, sizeof(buf), MSG_WAITALL);
+    if (r <= 0) { perror("recv_conninfo"); throw runtime_error("recv_conninfo failed"); }
+    size_t offset = 0;
+    ConnInfo ci{};
+    uint32_t qpn_n, psn_n, rkey_n;
+    uint16_t lid_n;
+    uint64_t vaddr_n;
+    memcpy(&qpn_n, buf + offset, sizeof(qpn_n)); offset += sizeof(qpn_n);
+    memcpy(&psn_n, buf + offset, sizeof(psn_n)); offset += sizeof(psn_n);
+    memcpy(&lid_n, buf + offset, sizeof(lid_n)); offset += sizeof(lid_n);
+    memcpy(&rkey_n, buf + offset, sizeof(rkey_n)); offset += sizeof(rkey_n);
+    memcpy(&vaddr_n, buf + offset, sizeof(vaddr_n)); offset += sizeof(vaddr_n);
+
+    ci.qpn = ntohl(qpn_n);
+    ci.psn = ntohl(psn_n);
+    ci.lid = ntohs(lid_n);
+    ci.rkey = ntohl(rkey_n);
+    ci.vaddr = be64toh(vaddr_n);
+    return ci;
+}
+
+// Create a TCP server, accept one connection, return fd
+int tcp_server_accept(const char *bind_ip, int port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) { perror("socket"); throw runtime_error("socket"); }
+    int opt=1; setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, bind_ip, &addr.sin_addr);
+    if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); throw runtime_error("bind"); }
+    if (listen(sock, 1) < 0) { perror("listen"); throw runtime_error("listen"); }
+    cout << "Control-plane listening " << bind_ip << ":" << port << "\n";
+    int c = accept(sock, nullptr, nullptr);
+    if (c < 0) { perror("accept"); throw runtime_error("accept"); }
+    close(sock);
+    return c;
+}
+
+// Connect to tcp server and return fd
+int tcp_client_connect(const char *server_ip, int port) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { perror("socket"); throw runtime_error("socket"); }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, server_ip, &addr.sin_addr);
+    if (connect(s, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("connect"); throw runtime_error("connect"); }
+    return s;
+}
+
+// Utility: modify QP to given state attributes (minimal)
+void modify_qp_to_init(struct ibv_qp* qp, int port) {
+    ibv_qp_attr attr{};
+    attr.qp_state = IBV_QPS_INIT;
+    attr.pkey_index = 0;
+    attr.port_num = port;
+    attr.qp_access_flags = IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
+    int r = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+    if (r) { cerr << "modify INIT failed: " << r << "\n"; throw runtime_error("modify INIT failed"); }
+}
+
+void modify_qp_to_rtr(struct ibv_qp* qp, uint32_t remote_qpn, uint32_t remote_psn, uint16_t dlid, int port) {
+    ibv_qp_attr attr{};
+    attr.qp_state = IBV_QPS_RTR;
+    attr.path_mtu = IBV_MTU_1024;
+    attr.dest_qp_num = remote_qpn;
+    attr.rq_psn = remote_psn;
+    attr.max_dest_rd_atomic = 1;
+    attr.min_rnr_timer = 12;
+    attr.ah_attr.is_global = 0;
+    attr.ah_attr.dlid = dlid;
+    attr.ah_attr.sl = 0;
+    attr.ah_attr.src_path_bits = 0;
+    attr.ah_attr.port_num = port;
+
+    int r = ibv_modify_qp(qp, &attr,
+                          IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                          IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+    if (r) { cerr << "modify RTR failed: " << r << "\n"; throw runtime_error("modify RTR failed"); }
+}
+
+void modify_qp_to_rts(struct ibv_qp* qp, uint32_t my_psn) {
+    ibv_qp_attr attr{};
+    attr.qp_state = IBV_QPS_RTS;
+    attr.timeout = 14;
+    attr.retry_cnt = 7;
+    attr.rnr_retry = 7;
+    attr.sq_psn = my_psn;
+    attr.max_rd_atomic = 1;
+
+    int r = ibv_modify_qp(qp, &attr,
+                          IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                          IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+    if (r) { cerr << "modify RTS failed: " << r << "\n"; throw runtime_error("modify RTS failed"); }
+}
+
+// Post an atomic fetch-and-add
+bool post_atomic_fetch_add(struct ibv_qp* qp, struct ibv_mr* local_mr, uint64_t local_addr_offset,
+                           uint64_t remote_addr, uint32_t remote_rkey, uint64_t add, uint64_t wr_id = 1, bool signaled=true) {
+    ibv_sge sge{};
+    sge.addr = (uintptr_t)((char*)local_mr->addr + local_addr_offset);
+    sge.length = 8; // atomic returns 8 bytes
+    sge.lkey = local_mr->lkey;
+
+    ibv_send_wr wr{};
+    wr.wr_id = wr_id;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
+    wr.send_flags = (signaled ? IBV_SEND_SIGNALED : 0);
+    wr.wr.atomic.remote_addr = remote_addr;
+    wr.wr.atomic.rkey = remote_rkey;
+    wr.wr.atomic.compare_add = add; // for fetch_and_add compare_add holds add value
+    ibv_send_wr* bad = nullptr;
+    int ret = ibv_post_send(qp, &wr, &bad);
+    if (ret) {
+        cerr << "ibv_post_send(atomic) failed: " << ret << "\n";
+        return false;
+    }
+    return true;
+}
+
+// Post an atomic compare-and-swap
+bool post_atomic_cas(struct ibv_qp* qp, struct ibv_mr* local_mr, uint64_t local_addr_offset,
+                     uint64_t remote_addr, uint32_t remote_rkey, uint64_t compare, uint64_t swap, uint64_t wr_id = 2, bool signaled=true) {
+    ibv_sge sge{};
+    sge.addr = (uintptr_t)((char*)local_mr->addr + local_addr_offset);
+    sge.length = 8; // returns old 8 bytes
+    sge.lkey = local_mr->lkey;
+
+    ibv_send_wr wr{};
+    wr.wr_id = wr_id;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
+    wr.send_flags = (signaled ? IBV_SEND_SIGNALED : 0);
+    wr.wr.atomic.remote_addr = remote_addr;
+    wr.wr.atomic.rkey = remote_rkey;
+    wr.wr.atomic.compare_add = compare; // for CMP_AND_SWP, compare_add used as compare; swap in wr.wr.atomic.swap
+    wr.wr.atomic.swap = swap;
+    ibv_send_wr* bad = nullptr;
+    int ret = ibv_post_send(qp, &wr, &bad);
+    if (ret) {
+        cerr << "ibv_post_send(cas) failed: " << ret << "\n";
+        return false;
+    }
+    return true;
+}
+
+// Poll for single WC on CQ (blocking loop with small sleep)
+bool poll_for_wc(struct ibv_cq* cq, struct ibv_wc &wc, int timeout_ms=5000) {
+    const int max_wc = 8;
+    struct ibv_wc wcs[max_wc];
+    int elapsed = 0;
+    while (elapsed < timeout_ms) {
+        int ne = ibv_poll_cq(cq, max_wc, wcs);
+        if (ne < 0) { cerr << "ibv_poll_cq error\n"; return false; }
+        if (ne == 0) {
+            std::this_thread::sleep_for(milliseconds(1));
+            elapsed += 1;
+            continue;
+        }
+        // return first
+        wc = wcs[0];
+        if (wc.status != IBV_WC_SUCCESS) {
+            cerr << "WC error status=" << wc.status << " opcode=" << wc.opcode << "\n";
+            return false;
+        }
+        return true;
+    }
+    cerr << "poll timeout\n";
+    return false;
+}
+
+int main(int argc, char** argv) {
+    // very small arg parsing
+    string mode = "server";
+    string bind_ip = "0.0.0.0";
+    string server_ip = "127.0.0.1";
+    int port = 5000;
+    int ib_port = 1;
+
+    for (int i=1;i<argc;i++){
+        string a = argv[i];
+        if (a=="--mode" && i+1<argc) mode = argv[++i];
+        if (a=="--bind" && i+1<argc) bind_ip = argv[++i];
+        if (a=="--server" && i+1<argc) server_ip = argv[++i];
+        if (a=="--port" && i+1<argc) port = stoi(argv[++i]);
+        if (a=="--ib-port" && i+1<argc) ib_port = stoi(argv[++i]);
+    }
+
+    // open first IB device
+    int num_devs = 0;
+    ibv_device** dev_list = ibv_get_device_list(&num_devs);
+    if (!dev_list || num_devs == 0) { cerr << "No IB devices\n"; return 1; }
+    ibv_device* dev = dev_list[0];
+    ibv_context* ctx = ibv_open_device(dev);
+    if (!ctx) { cerr << "ibv_open_device failed\n"; return 1; }
+    cout << "Opened device\n";
+
+    // create PD + CQ
+    ibv_pd* pd = ibv_alloc_pd(ctx);
+    if (!pd) { cerr << "alloc pd failed\n"; return 1; }
+    ibv_cq* cq = ibv_create_cq(ctx, DEFAULT_CQ_SIZE, nullptr, nullptr, 0);
+    if (!cq) { cerr << "create cq failed\n"; return 1; }
+
+    // create QP attributes
+    ibv_qp_init_attr qp_init{};
+    qp_init.send_cq = cq;
+    qp_init.recv_cq = cq;
+    qp_init.qp_type = IBV_QPT_RC;
+    qp_init.cap.max_send_wr = 1024;
+    qp_init.cap.max_recv_wr = DEFAULT_RX_DEPTH;
+    qp_init.cap.max_send_sge = 1;
+    qp_init.cap.max_recv_sge = 1;
+    qp_init.cap.max_inline_data = 256;
+
+    ibv_qp* qp = ibv_create_qp(pd, &qp_init);
+    if (!qp) { cerr << "create qp failed\n"; return 1; }
+
+    // set local PSN / LID
+    uint32_t my_psn = DEFAULT_PSN;
+    uint16_t my_lid = get_local_lid(ctx, ib_port);
+    cout << "Local LID="<< my_lid << " QPN=" << qp->qp_num << "\n";
+
+    // allocate local buffer for atomics - 8 bytes aligned
+    const size_t ATOMIC_AREA_SIZE = 4096;
+    void* buf = nullptr;
+    if (posix_memalign(&buf, 4096, ATOMIC_AREA_SIZE)) { perror("posix_memalign"); return 1; }
+    memset(buf, 0, ATOMIC_AREA_SIZE);
+
+    // register MR with REMOTE_ATOMIC
+    ibv_mr* mr = ibv_reg_mr(pd, buf, ATOMIC_AREA_SIZE,
+                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                            IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+    if (!mr) { cerr << "reg_mr failed\n"; return 1; }
+
+    // move QP to INIT
+    modify_qp_to_init(qp, ib_port);
+    cout << "QP moved to INIT\n";
+
+    // Control-plane exchange via TCP
+    int ctrl_fd = -1;
+    ConnInfo local_ci{};
+    local_ci.qpn = qp->qp_num;
+    local_ci.psn = my_psn;
+    local_ci.lid = my_lid;
+    local_ci.rkey = mr->rkey;
+    local_ci.vaddr = (uint64_t)mr->addr;
+
+    ConnInfo remote_ci{};
+    if (mode == "server") {
+        ctrl_fd = tcp_server_accept(bind_ip.c_str(), port);
+        // server sends its info then receives client's
+        send_conninfo(ctrl_fd, local_ci);
+        remote_ci = recv_conninfo(ctrl_fd);
+    } else {
+        ctrl_fd = tcp_client_connect(server_ip.c_str(), port);
+        // client receives server's info then sends its own
+        remote_ci = recv_conninfo(ctrl_fd);
+        send_conninfo(ctrl_fd, local_ci);
+    }
+    cout << "Remote QPN="<< remote_ci.qpn << " remote_psn="<<remote_ci.psn<<" remote_lid="<<remote_ci.lid<<"\n";
+
+    // move to RTR/RTS
+    modify_qp_to_rtr(qp, remote_ci.qpn, remote_ci.psn, remote_ci.lid, ib_port);
+    modify_qp_to_rts(qp, my_psn);
+    cout << "QP RTR/RTS done\n";
+
+    // optionally post a recv (not required for atomic, but useful)
+    ibv_sge sge{};
+    sge.addr = (uintptr_t)buf;
+    sge.length = ATOMIC_AREA_SIZE;
+    sge.lkey = mr->lkey;
+    ibv_recv_wr recv_wr{};
+    recv_wr.wr_id = 0;
+    recv_wr.sg_list = &sge;
+    recv_wr.num_sge = 1;
+    ibv_recv_wr* bad_recv = nullptr;
+    if (ibv_post_recv(qp, &recv_wr, &bad_recv)) { cerr << "post_recv failed\n"; }
+
+    // Now, validation:
+    // server: will wait for client's atomics and reply with a send to complete ping-pong
+    // client: will issue N atomic fetch_adds to server's remote vaddr and poll for completion
+
+    const int ITER = 1000;
+    if (mode == "client") {
+        cout << "Client: performing atomic fetch_and_add ping-pong to remote vaddr="<<std::hex<<remote_ci.vaddr<<dec<<"\n";
+        // local slot where result will land: offset 0 in MR
+        uint64_t *local_slot = (uint64_t*)buf;
+        // warmup
+        for (int i=0;i<10;i++) {
+            post_atomic_fetch_add(qp, mr, 0, remote_ci.vaddr, remote_ci.rkey, 1, i+1, true);
+            ibv_wc wc;
+            if (!poll_for_wc(cq, wc)) { cerr << "warmup poll failed\n"; }
+        }
+
+        auto t0 = high_resolution_clock::now();
+        for (int i=0;i<ITER;i++) {
+            // post fetch_add of +1 to remote; remote returns old value into our local_slot
+            if (!post_atomic_fetch_add(qp, mr, 0, remote_ci.vaddr, remote_ci.rkey, 1, i+1000, true)) {
+                cerr<<"post_atomic failed\n"; break;
+            }
+            ibv_wc wc;
+            if (!poll_for_wc(cq, wc)) { cerr<<"poll failed\n"; break; }
+            uint64_t old = be64toh(*local_slot);
+            // optional: verify expected increasing value (depends on server behavior)
+            //cout<<"iter "<<i<<" old="<<old<<"\n";
+        }
+        auto t1 = high_resolution_clock::now();
+        double avg_us = duration_cast<duration<double, std::micro>>(t1 - t0).count() / ITER;
+        cout << "Client: performed " << ITER << " fetch_add ops; avg latency (post->completion) = " << avg_us << " us\n";
+
+        // Test CMP_AND_SWP: attempt to CAS expected value to new
+        uint64_t compare = 0;
+        uint64_t swap = 0xdeadbeef;
+        // place result into local_slot
+        if (!post_atomic_cas(qp, mr, 0, remote_ci.vaddr, remote_ci.rkey, compare, swap, 2000, true)) {
+            cerr<<"post_cas failed\n";
+        } else {
+            ibv_wc wc;
+            if (poll_for_wc(cq, wc)) {
+                uint64_t old = be64toh(*local_slot);
+                cout << "CAS returned old=" << std::hex << old << dec << "\n";
+            }
+        }
+    } else { // server role: respond to atomic ops by doing a SEND to client (as ACK) or just idle
+        cout << "Server: waiting for atomics from client. Will print first 10 results.\n";
+        int seen = 0;
+        while (seen < ITER) {
+            ibv_wc wc;
+            if (poll_for_wc(cq, wc)) {
+                if (wc.opcode == IBV_WC_RECV) {
+                    cout << "server: got recv\n";
+                } else if (wc.opcode == IBV_WC_ATOMIC_FETCH_AND_ADD || wc.opcode == IBV_WC_ATOMIC_CMP_AND_SWP || wc.opcode == IBV_WC_SEND) {
+                    // some HCAs report atomic completions as SEND/ATOMIC
+                }
+                // The atomic fetched result will be written into the client's MR; server doesn't see it as a message
+                seen++;
+            }
+        }
+        cout << "Server done seen="<<seen<<"\n";
+    }
+
+    // cleanup
+    close(ctrl_fd);
+    ibv_dereg_mr(mr);
+    free(buf);
+    ibv_destroy_qp(qp);
+    ibv_destroy_cq(cq);
+    ibv_dealloc_pd(pd);
+    ibv_close_device(ctx);
+    ibv_free_device_list(dev_list);
+    return 0;
+}
