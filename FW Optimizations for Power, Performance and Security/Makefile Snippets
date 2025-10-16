@@ -1,0 +1,16 @@
+# Makefile fragment
+CROSS_COMPILE ?= arm-none-eabi-
+CC = $(CROSS_COMPILE)gcc
+LD = $(CROSS_COMPILE)ld
+
+CFLAGS += -march=armv7-a -mfpu=neon -mfloat-abi=hard
+CFLAGS += -O2                    # or -Os for size-sensitive builds
+CFLAGS += -flto -fuse-linker-plugin
+CFLAGS += -ffunction-sections -fdata-sections
+CFLAGS += -fstack-protector-strong -fno-exceptions -fno-rtti
+CFLAGS += -fno-common -g0         # remove debug in release
+LDFLAGS += -Wl,--gc-sections -flto
+
+# Example target
+firmware.bin: $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^
