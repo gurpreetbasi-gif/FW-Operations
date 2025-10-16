@@ -1,0 +1,10 @@
+struct rx_slot {
+    void *vaddr;
+    uint64_t dma_addr;
+    uint32_t lkey;
+    int in_use;
+};
+struct rx_pool {
+    struct rx_slot *slots;
+    int count;
+};
