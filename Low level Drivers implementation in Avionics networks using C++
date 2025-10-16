@@ -1,0 +1,250 @@
+// rdma_session.cpp
+// Build: g++ rdma_session.cpp -o rdma_session -libverbs -lrdmacm -std=c++17 -O2 -pthread
+//
+// Minimal user-space RDMA/InfiniBand session example (verbs).
+// Not complete production code — framework to extend.
+
+#include <infiniband/verbs.h>
+#include <rdma/rdma_cma.h>
+#include <unistd.h>
+#include <cstring>
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <cassert>
+#include <arpa/inet.h>
+
+using namespace std::chrono_literals;
+
+struct Config {
+    int cq_size = 1024;
+    int rx_depth = 512;        // number of pre-posted receives
+    int inline_threshold = 256; // bytes
+};
+
+class RDMASession {
+public:
+    RDMASession(struct ibv_context* ctx, Config cfg = {}) : ctx_(ctx), cfg_(cfg) {
+        pd_ = ibv_alloc_pd(ctx_);
+        assert(pd_ && "Failed to alloc PD");
+        cq_ = ibv_create_cq(ctx_, cfg_.cq_size, nullptr, nullptr, 0);
+        assert(cq_ && "Failed to create CQ");
+    }
+
+    ~RDMASession() {
+        stop_polling();
+        if (qp_) ibv_destroy_qp(qp_);
+        if (cq_) ibv_destroy_cq(cq_);
+        if (pd_) ibv_dealloc_pd(pd_);
+        // deregister mem, free buffer...
+    }
+
+    // Create simple RC QP on the same context.
+    void create_qp() {
+        struct ibv_qp_init_attr qp_init = {};
+        qp_init.send_cq = cq_;
+        qp_init.recv_cq = cq_;
+        qp_init.qp_type = IBV_QPT_RC;
+        qp_init.cap.max_send_wr = 1024;
+        qp_init.cap.max_recv_wr = cfg_.rx_depth;
+        qp_init.cap.max_send_sge = 1;
+        qp_init.cap.max_recv_sge = 1;
+        qp_init.cap.max_inline_data = cfg_.inline_threshold;
+        qp_ = ibv_create_qp(pd_, &qp_init);
+        assert(qp_ && "create_qp failed");
+    }
+
+    // Transition states (INIT -> RTR -> RTS) minimal attributes for peer's QPN, LID, PSN
+    void setup_qp_remote(uint32_t remote_qpn, uint16_t remote_lid, uint32_t remote_psn, uint16_t port_num = 1) {
+        // to INIT
+        struct ibv_qp_attr attr = {};
+        attr.qp_state = IBV_QPS_INIT;
+        attr.pkey_index = 0;
+        attr.port_num = port_num;
+        attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+        int r = ibv_modify_qp(qp_, &attr,
+                              IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        assert(r == 0);
+
+        // to RTR
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state = IBV_QPS_RTR;
+        attr.path_mtu = IBV_MTU_1024;
+        attr.dest_qp_num = remote_qpn;
+        attr.rq_psn = remote_psn;
+        attr.max_dest_rd_atomic = 1;
+        attr.min_rnr_timer = 12;
+        attr.ah_attr.is_global = 0;
+        attr.ah_attr.dlid = remote_lid;
+        attr.ah_attr.sl = 0;
+        attr.ah_attr.src_path_bits = 0;
+        attr.ah_attr.port_num = port_num;
+        r = ibv_modify_qp(qp_, &attr,
+                          IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                          IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+        assert(r == 0);
+
+        // to RTS
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state = IBV_QPS_RTS;
+        attr.timeout = 14;
+        attr.retry_cnt = 7;
+        attr.rnr_retry = 7;
+        attr.sq_psn = local_psn_;
+        attr.max_rd_atomic = 1;
+        r = ibv_modify_qp(qp_, &attr,
+                          IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                          IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+        assert(r == 0);
+    }
+
+    // allocate and register buffers (one large buffer re-used)
+    void alloc_and_register_buffer(size_t size = 8ULL * 1024 * 1024) {
+        buf_size_ = size;
+        buf_ = (char*)aligned_alloc(4096, buf_size_);
+        assert(buf_);
+        memset(buf_, 0, buf_size_);
+        mr_ = ibv_reg_mr(pd_, buf_, buf_size_, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        assert(mr_ && "ibv_reg_mr failed");
+    }
+
+    // Pre-post receives (must do after creating QP and MR)
+    void prepost_receives(int count = -1) {
+        if (count == -1) count = cfg_.rx_depth;
+        struct ibv_sge sge;
+        sge.addr = (uintptr_t)buf_;
+        sge.length = buf_size_;
+        sge.lkey = mr_->lkey;
+
+        std::vector<ibv_recv_wr> rrs(count);
+        std::vector<ibv_recv_wr*> bad_rr;
+        for (int i = 0; i < count; ++i) {
+            rrs[i] = {};
+            rrs[i].wr_id = i;
+            rrs[i].next = (i+1 < count) ? &rrs[i+1] : nullptr;
+            rrs[i].sg_list = &sge;
+            rrs[i].num_sge = 1;
+        }
+        int ret = ibv_post_recv(qp_, &rrs[0], &bad_rr[0]); // post chain
+        if (ret) {
+            std::cerr << "post_recv returned " << ret << "\n";
+            // fallback: post singly
+            for (int i = 0; i < count; ++i) {
+                ibv_post_recv(qp_, &rrs[i], nullptr);
+            }
+        }
+    }
+
+    // Send a message (inline if small)
+    bool post_send(const void* data, size_t len, uint64_t wrid, bool signaled = true) {
+        assert(len <= buf_size_);
+        // copy into buffer head (simple ring could be used)
+        memcpy(buf_, data, len);
+
+        struct ibv_sge sge;
+        sge.addr = (uintptr_t)buf_;
+        sge.length = len;
+        sge.lkey = mr_->lkey;
+
+        struct ibv_send_wr wr = {};
+        wr.wr_id = wrid;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.opcode = IBV_WR_SEND;
+        if (len <= (size_t)cfg_.inline_threshold) {
+            wr.send_flags = IBV_SEND_INLINE;
+        } else {
+            wr.send_flags = 0;
+        }
+        if (signaled) wr.send_flags |= IBV_SEND_SIGNALED;
+
+        struct ibv_send_wr* bad_wr = nullptr;
+        int ret = ibv_post_send(qp_, &wr, &bad_wr);
+        if (ret) {
+            std::cerr << "ibv_post_send failed: " << ret << "\n";
+            return false;
+        }
+        return true;
+    }
+
+    // Poll completions (busy-poll). Should run on dedicated pinned core.
+    void poll_loop(std::atomic<bool>& running) {
+        const int max_wc = 16;
+        struct ibv_wc wc[max_wc];
+        while (running.load()) {
+            int ne = ibv_poll_cq(cq_, max_wc, wc);
+            if (ne < 0) {
+                std::cerr << "ibv_poll_cq error\n";
+                break;
+            } else if (ne == 0) {
+                // busy spin: optionally pause a few CPU cycles
+                std::this_thread::sleep_for(1us);
+                continue;
+            }
+            for (int i = 0; i < ne; ++i) {
+                handle_wc(wc[i]);
+            }
+        }
+    }
+
+    void start_polling() {
+        running_.store(true);
+        poll_thread_ = std::thread([this]{ poll_loop(running_); });
+    }
+
+    void stop_polling() {
+        if (running_.load()) {
+            running_.store(false);
+            if (poll_thread_.joinable()) poll_thread_.join();
+        }
+    }
+
+private:
+    void handle_wc(const ibv_wc& wc) {
+        if (wc.status != IBV_WC_SUCCESS) {
+            std::cerr << "WC error: status=" << wc.status << " opcode=" << wc.opcode << " wr_id=" << wc.wr_id << "\n";
+            // Implement recovery: retransmit, reconnect, log metrics...
+            return;
+        }
+        if (wc.opcode == IBV_WC_RECV) {
+            // Received data in buf_ (from pre-posted)
+            // Process in-line: parse header for seq number, etc.
+            // For reliability: send ACK back using post_send
+            process_recv((char*)buf_, wc.byte_len, wc.wr_id);
+            // re-post receive for that slot
+            ibv_post_recv(qp_, (ibv_recv_wr*)&(ibv_recv_wr){ .wr_id = wc.wr_id, .sg_list = (ibv_sge*)&(ibv_sge){ (uintptr_t)buf_, (uint32_t)buf_size_, mr_->lkey }, .num_sge = 1 }, nullptr);
+        } else if (wc.opcode == IBV_WC_SEND) {
+            // send completed
+            // update metrics
+        } else {
+            // other opcodes (RDMA_READ/WRITE completions)
+        }
+    }
+
+    void process_recv(char* ptr, uint32_t len, uint64_t wrid) {
+        // Example: first 8 bytes are sequence number (network order)
+        if (len >= 8) {
+            uint64_t seq;
+            memcpy(&seq, ptr, sizeof(seq));
+            seq = be64toh(seq);
+            // process payload ptr+8, length len-8
+            // send back ACK (simple example)
+            uint64_t ack = htobe64(seq);
+            post_send(&ack, sizeof(ack), /*wrid*/ seq, /*signaled*/ true);
+        }
+    }
+
+    struct ibv_context* ctx_{nullptr};
+    struct ibv_pd* pd_{nullptr};
+    struct ibv_cq* cq_{nullptr};
+    struct ibv_qp* qp_{nullptr};
+    struct ibv_mr* mr_{nullptr};
+    char* buf_{nullptr};
+    size_t buf_size_{0};
+    uint32_t local_psn_{0x1234};
+    Config cfg_;
+    std::atomic<bool> running_{false};
+    std::thread poll_thread_;
+};
