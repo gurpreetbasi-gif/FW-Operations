@@ -1,0 +1,86 @@
+<#
+.SYNOPSIS
+    Automated Advanced Firmware Testing Script
+.DESCRIPTION
+    Runs verification and stress tests for:
+        - CPU/memory bottlenecks
+        - Multi-rail NIC / PCIe setups
+        - Firmware diagnostics and logs
+    Saves logs per cycle with timestamp.
+#>
+
+param(
+    [int]$Cycles = 3,
+    [string]$LogRoot = "C:\Firmware_Test_Logs",
+    [string[]]$NICs = @("mlx5_0","mlx5_1"),      # Multi-rail NIC setup
+    [switch]$CollectFirmwareLogs
+)
+
+# Ensure log root exists
+if (!(Test-Path $LogRoot)) {
+    New-Item -ItemType Directory -Path $LogRoot | Out-Null
+}
+
+function Run-Test {
+    param(
+        [string]$Name,
+        [scriptblock]$Command,
+        [string]$LogFile
+    )
+    Write-Host "Running test: $Name"
+    try {
+        & $Command *>&1 | Tee-Object -FilePath $LogFile
+    } catch {
+        Write-Host "Error in $Name: $_"
+        "`nError: $_" | Out-File -Append -FilePath $LogFile
+    }
+}
+
+function Get-SystemMetrics {
+    param([string]$LogFile)
+    Write-Host "Collecting CPU/Memory metrics..."
+    $cpu = Get-Counter '\Processor(_Total)\% Processor Time'
+    $mem = Get-Counter '\Memory\Available MBytes'
+    $metrics = @()
+    $metrics += "CPU Usage: $($cpu.CounterSamples[0].CookedValue)%"
+    $metrics += "Available Memory: $($mem.CounterSamples[0].CookedValue) MB"
+    $metrics | Out-File -FilePath $LogFile
+}
+
+# Main loop
+for ($cycle=1; $cycle -le $Cycles; $cycle++) {
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $cycleLogDir = Join-Path $LogRoot "Cycle_$cycle`_$timestamp"
+    New-Item -ItemType Directory -Path $cycleLogDir | Out-Null
+    Write-Host "`n=== Starting Cycle $cycle ==="
+
+    # 1. Collect CPU / Memory metrics
+    $metricsLog = Join-Path $cycleLogDir "system_metrics.log"
+    Get-SystemMetrics -LogFile $metricsLog
+
+    # 2. Multi-Rail Performance Test (using ib_send_bw or custom tool)
+    foreach ($nic in $NICs) {
+        $logFile = Join-Path $cycleLogDir "bandwidth_$nic.log"
+        Run-Test -Name "Bandwidth Test $nic" -Command { ib_send_bw.exe -d $nic -n 10000 192.168.1.10 } -LogFile $logFile
+    }
+
+    # 3. CPU / Memory Stress Test (example using Stress-ng if installed)
+    $stressLog = Join-Path $cycleLogDir "cpu_mem_stress.log"
+    Run-Test -Name "CPU/Memory Stress" -Command { stress-ng.exe --cpu 4 --vm 2 --vm-bytes 512M --timeout 30s --metrics-brief } -LogFile $stressLog
+
+    # 4. Firmware / NIC Diagnostics
+    if ($CollectFirmwareLogs) {
+        foreach ($nic in $NICs) {
+            $fwLog = Join-Path $cycleLogDir "firmware_$nic.log"
+            Write-Host "Collecting firmware logs for $nic..."
+            # Example Mellanox commands (adjust path for your setup)
+            Run-Test -Name "Firmware Dump $nic" -Command { & "C:\Mellanox\mlx5cmd.exe" "-d /dev/mst/$nic --register dump --index 0x500" } -LogFile $fwLog
+            Run-Test -Name "Firmware Config $nic" -Command { & "C:\Mellanox\mlxconfig.exe" "-d /dev/mst/$nic query" } -LogFile $fwLog
+        }
+    }
+
+    Write-Host "=== Cycle $cycle Completed ===`n"
+    Start-Sleep -Seconds 2
+}
+
+Write-Host "`nAll cycles completed. Logs saved under: $LogRoot"
